@@ -494,16 +494,14 @@ async function enforceRealRouteLimit(sel,limitM,minVisits){
 }
 
 async function fillRouteCorridorVisits(sel,candidates,totalM,limitM,maxVisits){
-  // Utilise calcRoute OSRM pour valider les insertions — même logique que corridorDiagnosticHtml
-  // Cela garantit cohérence entre "admissible" dans le diagnostic et ce qui est réellement inséré
+  // Utilise calcRoute OSRM — même logique que corridorDiagnosticHtml
+  // Garantit cohérence : si diagnostic dit "admissible", on l'insère vraiment
   let routeCoords=await calcRoute(sel.map(g=>({lat:g.lat,lng:g.lng})));
-  if(!routeCoords)routeCoords=sel.map(g=>[g.lng,g.lat]);
+  if(!routeCoords){routeCoords=sel.map(g=>[g.lng,g.lat]);routeCoords.distanceM=totalM;}
   let realM=routeCoords.distanceM||totalM;
-  let improved=true;
-  let passes=0;
+  let improved=true, passes=0;
   while(improved&&passes<Math.max(12,maxVisits)){
-    passes++;
-    improved=false;
+    passes++; improved=false;
     const selectedMats=new Set(sel.map(g=>g.matricule));
     const corridor=candidates
       .filter(r=>r.lat&&r.lng&&!selectedMats.has(r.matricule)&&!plannedMats.has(r.matricule))
@@ -514,42 +512,1173 @@ async function fillRouteCorridorVisits(sel,candidates,totalM,limitM,maxVisits){
     if(sel.length<maxVisits){
       let best=null;
       for(const cand of corridor){
-        // Tester toutes les positions d'insertion avec calcRoute OSRM
-        let bestPos=0,bestM=Infinity;
-        // Pré-trier les positions par haversine pour réduire les appels OSRM
+        // Pré-trier positions par haversine, tester les 3 meilleures avec OSRM
         const positions=[];
         for(let pos=0;pos<=sel.length;pos++){
-          const prev=pos>0?sel[pos-1]:null;
-          const next=pos<sel.length?sel[pos]:null;
-          const approx=prev&&next
-            ?(haversine(prev,cand)+haversine(cand,next)-haversine(prev,next))
-            :prev?haversine(prev,cand):next?haversine(cand,next):0;
+          const prev=pos>0?sel[pos-1]:null, next=pos<sel.length?sel[pos]:null;
+          const approx=prev&&next?(haversine(prev,cand)+haversine(cand,next)-haversine(prev,next)):prev?haversine(prev,cand):next?haversine(cand,next):0;
           positions.push({pos,approx});
         }
         positions.sort((a,b)=>a.approx-b.approx);
-        // Tester seulement les 3 meilleures positions par haversine
+        let bestPos=null, bestM=Infinity, bestRoute=null;
         for(const p of positions.slice(0,3)){
           const trial=[...sel.slice(0,p.pos),cand,...sel.slice(p.pos)];
-          const trialRoute=await calcRoute(trial.map(g=>({lat:g.lat,lng:g.lng})));
-          if(!trialRoute||trialRoute.distanceM==null)continue;
-          if(trialRoute.distanceM>limitM)continue;
-          if(trialRoute.distanceM<bestM){bestM=trialRoute.distanceM;bestPos=p.pos;routeCoords=trialRoute;}
+          const r=await calcRoute(trial.map(g=>({lat:g.lat,lng:g.lng})));
+          if(!r||r.distanceM==null||r.distanceM>limitM)continue;
+          if(r.distanceM<bestM){bestM=r.distanceM;bestPos=p.pos;bestRoute=r;}
         }
-        if(bestM===Infinity)continue;
-        const score=bestM + cand._routeDist*5 - (cand.pri===1?180:0) - (cand.priScore||0)*0.15;
-        if(!best||score<best.score)best={cand,pos:bestPos,realM:bestM,score};
+        if(bestPos===null)continue;
+        const score=bestM+cand._routeDist*5-(cand.pri===1?180:0)-(cand.priScore||0)*0.15;
+        if(!best||score<best.score)best={cand,pos:bestPos,realM:bestM,route:bestRoute,score};
       }
       if(best){
         sel.splice(best.pos,0,best.cand);
         realM=best.realM;
+        routeCoords=best.route;
         improved=true;
         continue;
       }
     }
   }
-  // Distance finale OSRM
   const finalRoute=await calcRoute(sel.map(g=>({lat:g.lat,lng:g.lng})));
   const finalM=finalRoute&&finalRoute.distanceM!=null?finalRoute.distanceM:realM;
   return {selected:sel,totalM:finalM,routeCoords:finalRoute||routeCoords};
 }
 
+function orderFixedTour(indices,matrix,startIdx,costMatrix=null){
+  if(!indices.length)return {tour:[],totalM:0};
+  const scoreMatrix=costMatrix||matrix;
+  const remaining=new Set(indices), tour=[];
+  const first=remaining.has(startIdx)?startIdx:indices[0];
+  tour.push(first);remaining.delete(first);
+  while(remaining.size){
+    let best=null;
+    for(const cand of remaining){
+      for(let pos=0;pos<=tour.length;pos++){
+        let score=0;
+        if(pos===0)score=scoreMatrix[cand][tour[0]]||0;
+        else if(pos===tour.length)score=scoreMatrix[tour[tour.length-1]][cand]||0;
+        else{
+          const prev=tour[pos-1], next=tour[pos];
+          score=(scoreMatrix[prev][cand]||0)+(scoreMatrix[cand][next]||0)-(scoreMatrix[prev][next]||0);
+        }
+        if(!best||score<best.score)best={cand,pos,score};
+      }
+    }
+    tour.splice(best.pos,0,best.cand);
+    remaining.delete(best.cand);
+  }
+  return {tour,totalM:routeDistance(tour,matrix)};
+}
+function improveTourBySwap(candidates,matrix,tour,startIdx,limitM,costMatrix=null){
+  if(tour.length<3)return {tour,totalM:routeDistance(tour,matrix)};
+  const scoreMatrix=costMatrix||matrix;
+  let bestTour=[...tour], bestM=routeDistance(bestTour,matrix), bestScore=routeDistance(bestTour,scoreMatrix);
+  for(let pass=0;pass<8;pass++){
+    let improved=false;
+    const selectedSet=new Set(bestTour);
+    for(let outPos=0;outPos<bestTour.length;outPos++){
+      for(let inIdx=0;inIdx<candidates.length;inIdx++){
+        if(selectedSet.has(inIdx))continue;
+        const trialSet=bestTour.map((idx,pos)=>pos===outPos?inIdx:idx);
+        const trial=orderFixedTour(trialSet,matrix,startIdx,scoreMatrix);
+        const trialScore=routeDistance(trial.tour,scoreMatrix);
+        if(trial.totalM<=limitM&&trialScore<bestScore-1){
+          bestTour=trial.tour;bestM=trial.totalM;bestScore=trialScore;improved=true;
+          break;
+        }
+      }
+      if(improved)break;
+    }
+    if(!improved)break;
+  }
+  return {tour:bestTour,totalM:bestM};
+}
+
+function poolIcon(color,mat,zoom,isCritique){
+  const showLabel=zoom>=16;
+  const label=showLabel?`<div style="font-family:monospace;font-size:9px;color:${color};white-space:nowrap;margin-top:1px;background:rgba(255,255,255,0.85);padding:0 2px;border-radius:2px">${mat}</div>`:'';
+  if(isCritique){
+    return L.divIcon({
+      html:`<div style="display:flex;flex-direction:column;align-items:center">
+        <svg width="18" height="18" style="overflow:visible">
+          <circle cx="9" cy="9" r="8" fill="#ff6600" fill-opacity="0.9" stroke="#fff" stroke-width="1.5"/>
+          <text x="9" y="13" text-anchor="middle" font-size="10">⭐</text>
+        </svg>${label}
+      </div>`,
+      className:'',iconSize:[18,showLabel?30:18],iconAnchor:[9,9]
+    });
+  }
+  return L.divIcon({
+    html:`<div style="display:flex;flex-direction:column;align-items:center">
+      <svg width="14" height="14" style="overflow:visible">
+        <circle cx="7" cy="7" r="6" fill="white" fill-opacity="0.6" stroke="${color}" stroke-width="2"/>
+      </svg>${label}
+    </div>`,
+    className:'',iconSize:[14,showLabel?26:14],iconAnchor:[7,7]
+  });
+}
+
+function selIcon(color,seq,mat,isMultiple){
+  const badge=isMultiple
+    ?`<div style="position:absolute;top:-5px;right:-5px;background:#f39c12;color:#fff;
+        width:14px;height:14px;border-radius:50%;display:flex;align-items:center;
+        justify-content:center;font-size:7px;font-weight:700;border:1.5px solid #fff">2+</div>`:'';
+  return L.divIcon({
+    html:`<div style="display:flex;flex-direction:column;align-items:center">
+      <div style="position:relative">
+        <div style="background:${color};color:#fff;width:26px;height:26px;border-radius:50%;
+          display:flex;align-items:center;justify-content:center;font-size:11px;font-weight:700;
+          border:2px solid rgba(255,255,255,0.9);box-shadow:0 2px 6px rgba(0,0,0,0.35)">${seq}</div>
+        ${badge}
+      </div>
+      <div style="font-family:monospace;font-size:9px;font-weight:600;color:#1a1a2e;
+        background:rgba(255,255,255,0.92);padding:1px 3px;border-radius:2px;
+        white-space:nowrap;margin-top:2px;box-shadow:0 1px 3px rgba(0,0,0,0.15)">${mat}</div>
+    </div>`,
+    className:'',iconSize:[80,40],iconAnchor:[13,13]
+  });
+}
+
+function popupHtml(r,isSelected){
+  const c=COLORS[r.pri]||'#999';
+  const tl=TYPE_LABELS[r.pri]||'';
+  const bg=TYPE_BG[r.pri]||'#f5f5f5';
+  const ret=r.retard>0?`<div style="font-size:11px;color:#e74c3c;font-weight:600;margin-top:3px">⚠ Retard: ${r.retard} jours</div>`:'';
+  const priHtml=r.priScore!=null?`<div style="font-size:11px;color:#e67e22;font-weight:600;margin-top:2px">⭐ Priorité: ${r.priScore}</div>`:'';
+  const pn=r.permisNo?`<div style="font-size:11px;color:#888">Permis: ${r.permisNo}</div>`:'';
+  const pf=r.permisFin?`<div style="font-size:11px;color:#888">Fin travaux: ${r.permisFin}</div>`:'';
+  const allTypesHtml=r.allTypes&&r.allTypes.length>1
+    ?`<div style="font-size:11px;color:#f39c12;margin-top:2px">📋 ${r.allTypes.join(' + ')}</div>`:'';
+  const btnHtml=planningDone
+    ?(isSelected
+      ?`<button class="popup-btn remove" onclick="removeVisit('${r.matricule}')">➖ Retirer de la tournée</button>`
+      :`<button class="popup-btn add" onclick="addVisit('${r.matricule}')">➕ Ajouter à la tournée</button>`)
+    :'';
+  return `<div style="min-width:200px;font-family:'Segoe UI',Arial,sans-serif">
+    <div style="font-family:monospace;font-size:12px;font-weight:700;color:#1a1a2e;margin-bottom:3px">${r.matricule}</div>
+    <div style="font-size:12px;color:#333;margin-bottom:2px">${r.adresse.replace(/,\s*SHERBROOKE.*/,'')}</div>
+    <div style="font-size:11px;color:#888;margin-bottom:3px">UV: ${r.uv} · Bassin ${r.bassin}</div>
+    <span style="font-size:11px;font-weight:600;padding:1px 6px;border-radius:3px;background:${bg};color:${c}">${tl}</span>
+    ${allTypesHtml}${pn}${pf}${ret}${priHtml}${btnHtml}
+  </div>`;
+}
+
+// ─── CARTE ───────────────────────────────────────────────────────────────────
+function initMap(){
+  document.getElementById('map-placeholder').style.display='none';
+  const mapEl=document.getElementById('map');
+  mapEl.style.display='block';mapEl.style.flex='1';
+  lmap=L.map('map').setView([45.40,-71.90],12);
+  L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',{
+    attribution:'© OpenStreetMap contributors',maxZoom:19
+  }).addTo(lmap);
+  layerPool=L.layerGroup().addTo(lmap);
+  layerSel=L.layerGroup().addTo(lmap);
+  layerRoute=L.layerGroup().addTo(lmap);
+  document.getElementById('map-legend').style.display='block';
+  lmap.on('zoomend',()=>{if(currentBassin!==null)redrawPool(currentBassin,false);});
+  setTimeout(()=>lmap.invalidateSize(),100);
+}
+
+function redrawPool(bassin,fitBounds){
+  currentBassin=bassin;layerPool.clearLayers();
+  const zoom=lmap?lmap.getZoom():12;
+  const selMats=new Set(selected.map(r=>r.matricule));
+  const shownPos=new Set(selected.filter(g=>g.lat&&g.lng).map(g=>`${g.lat.toFixed(5)},${g.lng.toFixed(5)}`));
+  const pts=pool
+    .filter(r=>bassin!==null?Number(r.bassin)===Number(bassin):true)
+    .filter(r=>!plannedMats.has(r.matricule))
+    .filter(r=>r.lat&&r.lng&&!selMats.has(r.matricule))
+    .filter(r=>{const k=`${r.lat.toFixed(5)},${r.lng.toFixed(5)}`;if(shownPos.has(k))return false;shownPos.add(k);return true;});
+  pts.forEach(r=>{
+    const isCrit=(params.prioriteHaute&&r.priScore!=null&&r.priScore>=SEUIL_PRIORITE_CRITIQUE);
+    const c=COLORS[r.pri]||'#999';
+    L.marker([r.lat,r.lng],{icon:poolIcon(c,r.matricule,zoom,isCrit)})
+     .bindPopup(popupHtml(r,false)).addTo(layerPool);
+  });
+  if(fitBounds&&pts.length>0)lmap.fitBounds(L.latLngBounds(pts.map(r=>[r.lat,r.lng])),{padding:[20,20]});
+  if(!fitBounds&&planningDone)setMapStatus(`${selected.length} visites sélectionnées`);
+}
+
+function redrawSelected(){
+  layerSel.clearLayers();
+  const hasMulti=selected.some(g=>g.isMultiple);
+  document.getElementById('leg-multi').style.display=hasMulti?'flex':'none';
+  const hasCrit=params.prioriteHaute&&pool.some(r=>r.priScore!=null&&r.priScore>=SEUIL_PRIORITE_CRITIQUE);
+  document.getElementById('leg-critique').style.display=hasCrit?'flex':'none';
+  selected.forEach((g,i)=>{
+    const c=COLORS[g.pri]||'#999';
+    L.marker([g.lat,g.lng],{icon:selIcon(c,i+1,g.matricule,g.isMultiple),zIndexOffset:1000})
+     .bindPopup(popupHtml(g,true)).addTo(layerSel);
+  });
+}
+
+function showFinalMap(bassin,totalKm,routeCoords,routeColor='#3b5bdb',isSecond=false){
+  if(!isSecond){layerPool.clearLayers();layerSel.clearLayers();layerRoute.clearLayers();}
+  const zoom=lmap?lmap.getZoom():12;
+  const selMats=new Set(selected.map(r=>r.matricule));
+  const shownPos=new Set(selected.filter(g=>g.lat&&g.lng).map(g=>`${g.lat.toFixed(5)},${g.lng.toFixed(5)}`));
+
+  pool.filter(r=>bassin!==null?Number(r.bassin)===Number(bassin):true)
+      .filter(r=>r.lat&&r.lng&&!selMats.has(r.matricule)&&!plannedMats.has(r.matricule))
+      .filter(r=>{const k=`${r.lat.toFixed(5)},${r.lng.toFixed(5)}`;if(shownPos.has(k))return false;shownPos.add(k);return true;})
+      .forEach(r=>{
+        const isCrit=(params.prioriteHaute&&r.priScore!=null&&r.priScore>=SEUIL_PRIORITE_CRITIQUE);
+        const c=COLORS[r.pri]||'#999';
+        L.marker([r.lat,r.lng],{icon:poolIcon(c,r.matricule,zoom,isCrit)})
+         .bindPopup(popupHtml(r,false)).addTo(layerPool);
+      });
+
+  // Trajet routier réel dans l'ordre de selected
+  if(routeCoords&&routeCoords.length>1){
+    L.polyline(routeCoords.map(c=>[c[1],c[0]]),{color:routeColor,weight:3,opacity:0.8}).addTo(layerRoute);
+  }else if(selected.length>1){
+    L.polyline(selected.map(g=>[g.lat,g.lng]),{color:routeColor,weight:2.5,opacity:0.7,dashArray:'7,4'}).addTo(layerRoute);
+  }
+
+  const hasMulti=selected.some(g=>g.isMultiple);
+  document.getElementById('leg-multi').style.display=hasMulti?'flex':'none';
+  selected.forEach((g,i)=>{
+    const c=COLORS[g.pri]||'#999';
+    L.marker([g.lat,g.lng],{icon:selIcon(c,i+1,g.matricule,g.isMultiple),zIndexOffset:1000})
+     .bindPopup(popupHtml(g,true)).addTo(layerSel);
+  });
+
+  const allPtsB=pool.filter(r=>bassin!==null?Number(r.bassin)===Number(bassin):true).filter(r=>r.lat&&r.lng);
+  if(!isSecond&&allPtsB.length>0&&iterationNo===1)lmap.fitBounds(L.latLngBounds(allPtsB.map(r=>[r.lat,r.lng])),{padding:[20,20]});
+  else if(iterationNo>1&&selected.length>0)lmap.fitBounds(L.latLngBounds(selected.map(r=>[r.lat,r.lng])),{padding:[40,40]});
+  else if(isSecond){
+    // Zoom sur les deux bassins
+    const allBoth=pool.filter(r=>r.lat&&r.lng);
+    if(allBoth.length>0)lmap.fitBounds(L.latLngBounds(allBoth.map(r=>[r.lat,r.lng])),{padding:[20,20]});
+  }
+  document.getElementById('leg-sel').style.display='flex';
+  document.getElementById('leg-route').style.display='flex';
+  if(isSecond){
+    const lr2=document.getElementById('leg-route2');
+    if(lr2)lr2.style.display='flex';
+  }
+  document.getElementById('btn-recalc').style.display='inline-flex';
+  document.getElementById('btn-select-rect').style.display='inline-flex';
+  ensureNextButton();
+  document.getElementById('btn-next').style.display='inline-flex';
+  document.getElementById('btn-export').style.display='inline-flex';
+  setMapStatus(`✅ ${selected.length} visites · ${totalKm} km`);
+  setTimeout(()=>lmap.invalidateSize(),100);
+}
+
+function setMapStatus(t){document.getElementById('map-status').textContent=t;}
+
+// ─── STATS ───────────────────────────────────────────────────────────────────
+function updateStats(totalKm){
+  if(!resultBoxId||!selected.length)return;
+  const box=document.getElementById(resultBoxId);
+  if(!box)return;
+  const nP=selected.filter(g=>g.pri===1).length;
+  const nM=selected.filter(g=>g.pri===2).length;
+  const nA=selected.filter(g=>g.pri===3).length;
+  const pP=Math.round(nP/selected.length*100)||0;
+  const pM=Math.round(nM/selected.length*100)||0;
+  const pA=Math.round(nA/selected.length*100)||0;
+  const urg=selected.filter(g=>g.retard>0).length;
+  const km=totalKm!==undefined?totalKm:'—';
+  box.querySelector('#stat-nb').textContent=selected.length;
+  box.querySelector('#stat-km').textContent=km+' km';
+  box.querySelector('#stat-pp').innerHTML=`${nP} <span style="font-size:12px;font-weight:400">${pP}%</span>`;
+  box.querySelector('#stat-pm').innerHTML=`${nM} <span style="font-size:12px;font-weight:400">${pM}%</span>`;
+  box.querySelector('#stat-pa').innerHTML=`${nA} <span style="font-size:12px;font-weight:400">${pA}%</span>`;
+  box.querySelector('#stat-urg').textContent=urg;
+  updateBadge();
+}
+
+// ─── AJOUTER / RETIRER ───────────────────────────────────────────────────────
+// ─── SÉLECTION PAR RECTANGLE ─────────────────────────────────────────────────
+let rectSelectActive=false;
+let rectSelectStart=null;
+let rectLayer=null;
+
+function toggleRectSelect(){
+  rectSelectActive=!rectSelectActive;
+  const btn=document.getElementById('btn-select-rect');
+  if(rectSelectActive){
+    btn.textContent='✕ Annuler sélection';
+    btn.classList.add('active');
+    lmap.dragging.disable();
+    lmap.getContainer().style.cursor='crosshair';
+  } else {
+    btn.textContent='⬛ Sélection zone';
+    btn.classList.remove('active');
+    lmap.dragging.enable();
+    lmap.getContainer().style.cursor='';
+    if(rectLayer){lmap.removeLayer(rectLayer);rectLayer=null;}
+    rectSelectStart=null;
+  }
+}
+
+// Événements carte pour le rectangle
+function initRectSelect(){
+  lmap.on('mousedown',function(e){
+    if(!rectSelectActive)return;
+    rectSelectStart=e.latlng;
+    if(rectLayer){lmap.removeLayer(rectLayer);rectLayer=null;}
+  });
+  lmap.on('mousemove',function(e){
+    if(!rectSelectActive||!rectSelectStart)return;
+    if(rectLayer)lmap.removeLayer(rectLayer);
+    const bounds=L.latLngBounds(rectSelectStart,e.latlng);
+    rectLayer=L.rectangle(bounds,{color:'#8e44ad',weight:2,fillOpacity:0.1}).addTo(lmap);
+  });
+  lmap.on('mouseup',function(e){
+    if(!rectSelectActive||!rectSelectStart)return;
+    const bounds=L.latLngBounds(rectSelectStart,e.latlng);
+    // Sélectionner tous les points du pool dans le rectangle
+    let added=0;
+    pool.forEach(r=>{
+      if(!r.lat||!r.lng)return;
+      if(selected.find(s=>s.matricule===r.matricule))return;
+      if(bounds.contains(L.latLng(r.lat,r.lng))){
+        selected.push(r);
+        added++;
+      }
+    });
+    if(added>0){
+      redrawPool(currentBassin,false);
+      redrawSelected();
+      setMapStatus(`${added} visite(s) ajoutée(s) — ${selected.length} total — Cliquez 🔄 pour recalculer`);
+      updateStats();
+    }
+    // Désactiver après sélection
+    toggleRectSelect();
+  });
+}
+
+function addVisit(matricule){
+  const r=pool.find(p=>p.matricule===matricule&&p.lat&&p.lng);
+  if(!r||selected.find(s=>s.matricule===matricule))return;
+  selected.push(r);lmap.closePopup();
+  redrawPool(currentBassin,false);redrawSelected();
+  setMapStatus(`${selected.length} visites — Cliquez 🔄 pour recalculer`);
+  updateStats();
+}
+function removeVisit(matricule){
+  selected=selected.filter(s=>s.matricule!==matricule);
+  lmap.closePopup();
+  redrawPool(currentBassin,false);redrawSelected();
+  setMapStatus(`${selected.length} visites — Cliquez 🔄 pour recalculer`);
+  updateStats();
+}
+
+// ─── RECALCUL ────────────────────────────────────────────────────────────────
+async function recalcTournee(){
+  if(selected.length<2)return;
+  setMapStatus('Recalcul en cours...');
+  const pts=selected.map(g=>{return{lat:g.lat,lng:g.lng}});
+  const mat=await calcMatrix(pts);
+  // Départ = point le plus central
+  const cLat=selected.reduce((s,g)=>s+g.lat,0)/selected.length;
+  const cLng=selected.reduce((s,g)=>s+g.lng,0)/selected.length;
+  let start=0,minD=Infinity;
+  selected.forEach((g,i)=>{const d=haversine({lat:g.lat,lng:g.lng},{lat:cLat,lng:cLng});if(d<minD){minD=d;start=i;}});
+  const costMat=buildCostMatrix(pts,mat);
+  const tour=nearestNeighbor(costMat,start);
+  const ordered=tour.map(i=>selected[i]);
+  // Mode manuel : pas de limite de distance — l'inspecteur a choisi ses visites
+  // On optimise juste l'ordre et on affiche la vraie distance OSRM
+  selected=ordered;
+  // Trajet dans l'ordre final — calcRoute avec segments de 9
+  let routeCoords=await calcRoute(selected.map(g=>{return{lat:g.lat,lng:g.lng}}));
+  // Fallback haversine si OSRM indisponible
+  let realM=routeCoords&&routeCoords.distanceM!=null
+    ? routeCoords.distanceM
+    : selected.reduce((s,g,i)=>i===0?0:s+haversine(selected[i-1],g)*1.6, 0);
+  if(!routeCoords){
+    routeCoords=selected.map(g=>[g.lng,g.lat]);
+    routeCoords.distanceM=realM;
+  }
+  console.log('[DIST] recalc manuel realM='+Math.round(realM)+'m pts='+selected.length);
+  // Pas d'enforceRealRouteLimit en mode manuel
+  const totalKm=formatKm(realM);
+  showFinalMap(currentBassin,totalKm,routeCoords);
+  updateStats(totalKm);
+  setMapStatus(`✅ ${selected.length} visites · ${totalKm} km / ${getTourLimitLabel()}`);
+}
+
+// ─── EXPORT JSON ─────────────────────────────────────────────────────────────
+function exportJSON(){
+  const data={
+    semaine:SEMAINE,
+    inspecteur:params.inspecteur,
+    visites:selected.map((g,i)=>{return{seq:i+1,matricule:g.matricule,dossier:g.dossier}})
+  };
+  const blob=new Blob([JSON.stringify(data,null,2)],{type:'application/json'});
+  const a=document.createElement('a');
+  a.href=URL.createObjectURL(blob);
+  a.download=`planification_${SEMAINE}_insp${params.inspecteur}.json`;
+  a.click();
+}
+
+// ─── CHAT ────────────────────────────────────────────────────────────────────
+async function nextIteration(){
+  if(!selected.length)return;
+  selected.forEach(g=>plannedMats.add(g.matricule));
+  lastTourPts=selected.filter(g=>g.lat&&g.lng).map(g=>({lat:g.lat,lng:g.lng}));
+  iterationNo++;
+  const bassin=currentBassin!==null?currentBassin:(params.bassin==='ALL'?null:Number(params.bassin));
+  const removed=plannedMats.size;
+  selected=[];
+  planningDone=false;
+  resultBoxId=null;
+  layerSel.clearLayers();
+  layerRoute.clearLayers();
+  redrawPool(bassin,false);
+  updateBadge();
+  await addG(`Itération ${iterationNo} : ${removed} visites déjà validées sont retirées. Recherche du prochain parcours le plus proche du quartier courant...`);
+  await launchPlanningForBassin(bassin,'#e67e22');
+}
+
+function addG(html,delay=700){
+  return new Promise(resolve=>{
+    const tr=document.createElement('div');tr.className='msg-row';
+    tr.innerHTML=`<div class="avatar">G+</div><div class="msg-content">
+      <div class="msg-label">GPLUS · ${nowTime()}</div>
+      <div class="bubble"><div class="typing-dots"><span></span><span></span><span></span></div></div>
+    </div>`;
+    document.getElementById('messages').appendChild(tr);scrollB();
+    setTimeout(()=>{
+      tr.remove();const uid='b'+Date.now();
+      const row=document.createElement('div');row.className='msg-row';
+      row.innerHTML=`<div class="avatar">G+</div><div class="msg-content">
+        <div class="msg-label">GPLUS · ${nowTime()}</div>
+        <div class="bubble" id="${uid}">${html}</div>
+      </div>`;
+      document.getElementById('messages').appendChild(row);scrollB();resolve(uid);
+    },delay);
+  });
+}
+function updateBubble(uid,html){
+  const bbl=document.getElementById(uid);if(bbl){bbl.innerHTML=html;scrollB();}
+}
+function addU(txt){
+  const row=document.createElement('div');row.className='msg-row';row.style.flexDirection='row-reverse';
+  row.innerHTML=`<div class="avatar usr">P</div><div class="msg-content" style="align-items:flex-end">
+    <div class="msg-label" style="text-align:right">Planificateur · ${nowTime()}</div>
+    <div class="bubble usr">${txt}</div>
+  </div>`;
+  document.getElementById('messages').appendChild(row);scrollB();
+}
+function scrollB(){const m=document.getElementById('messages');m.scrollTop=m.scrollHeight;}
+function addQR(uid,opts,cb){
+  const bbl=document.getElementById(uid);if(!bbl)return;
+  const wrap=document.createElement('div');wrap.className='qr-wrap';
+  opts.forEach(o=>{
+    const btn=document.createElement('button');btn.className='qr-btn';btn.textContent=o.label;
+    btn.onclick=()=>{wrap.querySelectorAll('.qr-btn').forEach(b=>b.disabled=true);btn.classList.add('sel');addU(o.label);cb(o.val,o.label);};
+    wrap.appendChild(btn);
+  });
+  bbl.appendChild(wrap);scrollB();
+}
+function addSliders(uid,defs,cb){
+  const bbl=document.getElementById(uid);if(!bbl)return;
+  const uid2='sc'+Date.now();
+  const rows=defs.map(d=>`<div class="sl-row">
+    <span class="sl-lbl">${d.label}</span>
+    <input type="range" id="sl${d.id}" min="${d.min}" max="${d.max}" value="${d.val}"
+      style="accent-color:${d.col||'#3b5bdb'}"
+      oninput="document.getElementById('sn${d.id}').textContent=this.value+'${d.unit}'">
+    <span class="sl-num" id="sn${d.id}">${d.val}${d.unit}</span>
+  </div>`).join('');
+  const blk=document.createElement('div');blk.className='sl-block';
+  blk.innerHTML=rows+`<button class="ok-btn" id="${uid2}">Confirmer →</button>`;
+  bbl.appendChild(blk);scrollB();
+  document.getElementById(uid2).onclick=()=>{document.getElementById(uid2).disabled=true;cb();};
+}
+function addChips(uid,chips,cb){
+  const bbl=document.getElementById(uid);if(!bbl)return;
+  const wrap=document.createElement('div');wrap.className='chips-wrap';
+  chips.forEach(c=>{
+    const el=document.createElement('button');el.className='chip';el.textContent=c.label;
+    el.onclick=()=>{el.classList.toggle('on');c.onToggle(el.classList.contains('on'));};
+    wrap.appendChild(el);
+  });
+  const btn=document.createElement('button');btn.className='ok-btn';btn.style.marginTop='9px';btn.textContent='Continuer →';
+  btn.onclick=()=>{btn.disabled=true;wrap.querySelectorAll('.chip').forEach(c=>c.disabled=true);cb();};
+  bbl.appendChild(wrap);bbl.appendChild(btn);scrollB();
+}
+
+// ─── CHARGEMENT ──────────────────────────────────────────────────────────────
+document.getElementById('file-inp').addEventListener('change',async(e)=>{
+  const file=e.target.files[0];if(!file)return;
+  const btn=document.getElementById('btn-join');btn.textContent='⏳';
+  try{
+    const ab=await file.arrayBuffer();
+    const wb=XLSX.read(ab,{cellDates:true});
+    const ws=wb.Sheets[wb.SheetNames[0]];
+    const json=XLSX.utils.sheet_to_json(ws);
+    if(typeof POOL_DATA==='undefined')throw new Error('POOL_DATA non chargé');
+    const coordMap={};
+    POOL_DATA.forEach(r=>{if(r.lat&&r.lon)coordMap[r.mat]={lat:r.lat,lng:r.lon};});
+    const typeMap={};
+    json.forEach(r=>{
+      const mat=String(r['Matricule']||'');
+      if(!typeMap[mat])typeMap[mat]=new Set();
+      typeMap[mat].add(r['Type de processus']||'');
+    });
+    const priMap={'Permis':1,'Inspection des mutations':2,"Actualisation d'inventaire":3};
+
+    // Pré-sélection par matricule : priorité la plus élevée si remplie, sinon date fin travaux la plus ancienne
+    const bestByMat={};
+    json.forEach(r=>{
+      const mat=String(r['Matricule']||'');
+      const ps=r['Priorité']!=null&&!isNaN(parseFloat(r['Priorité']))?parseFloat(r['Priorité']):null;
+      let pf=r['PRM - Date fin travaux'];
+      if(pf instanceof Date)pf=pf.toISOString().slice(0,10);
+      else pf=pf?String(pf).slice(0,10):'';
+      if(!bestByMat[mat]){bestByMat[mat]=r;return;}
+      const prev=bestByMat[mat];
+      const prevPs=prev['Priorité']!=null&&!isNaN(parseFloat(prev['Priorité']))?parseFloat(prev['Priorité']):null;
+      let prevPf=prev['PRM - Date fin travaux'];
+      if(prevPf instanceof Date)prevPf=prevPf.toISOString().slice(0,10);
+      else prevPf=prevPf?String(prevPf).slice(0,10):'';
+      // Règle : si l'un ou l'autre a un priScore → garder le plus élevé
+      if(ps!=null||prevPs!=null){
+        const ps2=ps||0, prevPs2=prevPs||0;
+        if(ps2>prevPs2)bestByMat[mat]=r;
+      } else {
+        // Aucun priScore → garder date fin travaux la plus ancienne
+        if(pf&&prevPf&&pf<prevPf)bestByMat[mat]=r;
+        else if(pf&&!prevPf)bestByMat[mat]=r;
+      }
+    });
+
+    pool=[];
+    Object.values(bestByMat)
+    .sort((a,b)=>(priMap[a['Type de processus']]||9)-(priMap[b['Type de processus']]||9))
+    .forEach(r=>{
+      const mat=String(r['Matricule']||'');
+      const type=r['Type de processus']||'';const pri=priMap[type]||3;
+      let pf=r['PRM - Date fin travaux'];
+      if(pf instanceof Date)pf=pf.toISOString().slice(0,10);
+      else pf=pf?String(pf).slice(0,10):'';
+      let lat=null,lng=null;
+      if(r['Latitude']&&!isNaN(parseFloat(r['Latitude']))){lat=parseFloat(r['Latitude']);lng=parseFloat(r['Longitude']);}
+      else if(coordMap[mat]){lat=coordMap[mat].lat;lng=coordMap[mat].lng;}
+      const allTypes=[...typeMap[mat]];
+      const priScore=r['Priorité']!=null&&!isNaN(parseFloat(r['Priorité']))?parseFloat(r['Priorité']):null;
+      pool.push({matricule:mat,dossier:r['N° dossier']||0,type,pri,priScore,
+        adresse:String(r['Adresse UE']||''),uv:String(r['Unité de voisinage']||''),
+        bassin:Number(r['UE Bassin'])||0,
+        multiple:r['Multiple']===true||String(r['Multiple']).toLowerCase()==='true',
+        aRevoir:r['À revoir']===true||String(r['À revoir']).toLowerCase()==='true',
+        permisNo:String(r['PRM - Numéro permis']||''),permisFin:pf,retard:calcRetard(pf),
+        allTypes,isMultiple:allTypes.length>1,lat,lng});
+    });
+    btn.textContent='✅ Fichier chargé';btn.className='btn-join ok';
+    updateBadge();
+    document.getElementById('txt-inp').disabled=false;
+    document.getElementById('btn-send').disabled=false;
+    const rawP=json.filter(r=>r['Type de processus']==='Permis').length;
+    const rawM=json.filter(r=>r['Type de processus']==='Inspection des mutations').length;
+    const rawA=json.filter(r=>r['Type de processus']==="Actualisation d'inventaire").length;
+    await addG(`✅ <b>${file.name}</b> — <b>${json.length}</b> dossiers · <b>${pool.length}</b> UE uniques.<br>
+      <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:6px;margin-top:8px">
+        <div style="background:#fdecea;border-radius:6px;padding:6px 8px;text-align:center">
+          <div style="font-size:16px;font-weight:700;color:#e74c3c">${rawP}</div>
+          <div style="font-size:10px;color:#888">Permis</div></div>
+        <div style="background:#f3e5f5;border-radius:6px;padding:6px 8px;text-align:center">
+          <div style="font-size:16px;font-weight:700;color:#8e44ad">${rawM}</div>
+          <div style="font-size:10px;color:#888">Insp. mutations</div></div>
+        <div style="background:#f5f5f5;border-radius:6px;padding:6px 8px;text-align:center">
+          <div style="font-size:16px;font-weight:700;color:#555">${rawA}</div>
+          <div style="font-size:10px;color:#888">Actualisations</div></div>
+      </div>`);
+    initMap();redrawPool(null,true);
+    setTimeout(()=>askBassin(),400);
+  }catch(err){
+    btn.textContent='❌ Erreur';
+    addG(`❌ Erreur: ${err.message||err}`);
+    console.error(err);
+  }
+});
+
+// ─── ÉTAPES ──────────────────────────────────────────────────────────────────
+function syncSlider(id){
+  const sl=document.getElementById('sl'+id+'2');
+  const nu=document.getElementById('n'+id+'2');
+  if(!sl||!nu)return;
+  nu.value=sl.value;
+  // Si 100% sur ce slider → les deux autres à 0
+  if(parseInt(sl.value)===100){
+    const others=({pe:['mu','ac'],mu:['pe','ac'],ac:['pe','mu']})[id];
+    others.forEach(o=>{
+      const s=document.getElementById('sl'+o+'2');
+      const n=document.getElementById('n'+o+'2');
+      if(s)s.value=0;if(n)n.value=0;
+    });
+  }
+  updateTotal();
+}
+function syncNum(id){
+  const sl=document.getElementById('sl'+id+'2');
+  const nu=document.getElementById('n'+id+'2');
+  if(!sl||!nu)return;
+  let v=Math.max(0,Math.min(100,parseInt(nu.value)||0));
+  nu.value=v;sl.value=v;
+  if(v===100){
+    const others=({pe:['mu','ac'],mu:['pe','ac'],ac:['pe','mu']})[id];
+    others.forEach(o=>{
+      const s=document.getElementById('sl'+o+'2');
+      const n=document.getElementById('n'+o+'2');
+      if(s)s.value=0;if(n)n.value=0;
+    });
+  }
+  updateTotal();
+}
+function updateTotal(){
+  const pe=parseInt(document.getElementById('slpe2')?.value)||0;
+  const mu=parseInt(document.getElementById('slmu2')?.value)||0;
+  const ac=parseInt(document.getElementById('slac2')?.value)||0;
+  const tot=pe+mu+ac;
+  const el=document.getElementById('total-pct');
+  if(!el)return;
+  el.textContent=tot+'%';
+  el.style.color=tot===100?'#27ae60':'#e74c3c';
+}
+function pickNoTypeRestriction(uid2){
+  params.noTypeRestriction=true;
+  params.pctPermis=0; params.pctMutations=0; params.pctActualisations=0;
+  document.getElementById(uid2).disabled=true;
+  ['slpe2','slmu2','slac2','npe2','nmu2','nac2'].forEach(id=>{const el=document.getElementById(id);if(el)el.disabled=true;});
+  addU('Aucune restriction de type · distance minimale');
+  setTimeout(askExtras,600);
+}
+function confirmRepartition(uid2){
+  const pe=parseInt(document.getElementById('slpe2')?.value)||0;
+  const mu=parseInt(document.getElementById('slmu2')?.value)||0;
+  const ac=parseInt(document.getElementById('slac2')?.value)||0;
+  const tot=pe+mu+ac;
+  if(tot===0){alert('Total ne peut pas être 0%');return;}
+  params.noTypeRestriction=false;
+  params.pctPermis=pe; params.pctMutations=mu; params.pctActualisations=ac;
+  document.getElementById(uid2).disabled=true;
+  addU(`Permis ${pe}% · Insp. mutations ${mu}% · Actualisations ${ac}%`);
+  const isMono=(pe===100||mu===100||ac===100);
+  if(isMono) setTimeout(()=>askCompletionOrder(pe===100?1:mu===100?2:3),600);
+  else setTimeout(askExtras,600);
+}
+async function askCompletionOrder(mainType){
+  const te={1:'🔴',2:'🟣',3:'⚫'};
+  const tl={1:'Permis',2:'Insp. mutations',3:'Actualisations'};
+  const others=[1,2,3].filter(t=>t!==mainType);
+  const uid=await addG(`Si pas assez de <b>${te[mainType]} ${tl[mainType]}</b> dans le rayon, compléter avec ?`);
+  addQR(uid,[
+    {label:`${te[others[0]]} ${tl[others[0]]} en 1er`,val:'a'},
+    {label:`${te[others[1]]} ${tl[others[1]]} en 1er`,val:'b'},
+  ],(val)=>{
+    params.completionOrder=val==='a'?[others[0],others[1]]:[others[1],others[0]];
+    addU('Complétion: '+params.completionOrder.map(t=>te[t]+' '+tl[t]).join(' → '));
+    setTimeout(askExtras,600);
+  });
+}
+
+async function askBassin(){
+  // Extraire les bassins uniques du pool
+  const bassinsSet=new Set();
+  pool.forEach(r=>{
+    if(r.bassin)bassinsSet.add(r.bassin);
+  });
+  const bassins=Array.from(bassinsSet).sort((a,b)=>a-b);
+  
+  if(bassins.length===0){
+    addG('❌ Aucun bassin trouvé dans le fichier.');
+    return;
+  }
+  
+  // Construire les options dynamiquement
+  const opts=bassins.map(b=>({label:`Bassin ${b}`,val:b}));
+  opts.push({label:'Tous les bassins',val:'ALL'});
+  
+  const uid=await addG('Pour quel bassin souhaitez-vous planifier?');
+  addQR(uid,opts,(val)=>{
+    params.bassin=val;
+    if(val==='ALL'){
+      currentBassin=null;
+    }else{
+      currentBassin=Number(val);
+    }
+    redrawPool(currentBassin,true);
+  initRectSelect();
+    updateBadge();
+    setTimeout(askNbVisites,600);
+  });
+}
+
+
+async function askNbVisites(){
+  const uid=await addG('Combien de visites souhaitez-vous planifier?');
+  addSliders(uid,[
+    {id:'nb',label:'Nombre de visites',min:10,max:50,val:30,unit:'',col:'#3b5bdb'},
+    {id:'mg',label:'Marge de flexibilité',min:0,max:30,val:20,unit:'%',col:'#e67e22'},
+  ],()=>{
+    params.nbVisites=parseInt(document.getElementById('slnb').value);
+    params.marge=parseInt(document.getElementById('slmg').value);
+    const min=Math.round(params.nbVisites*(1-params.marge/100));
+    const max=Math.round(params.nbVisites*(1+params.marge/100));
+    addU(`${params.nbVisites} visites ± ${params.marge}% (${min}–${max})`);
+    setTimeout(askDistance,600);
+  });
+}
+async function askDistance(){
+  const uid=await addG('Distance routière maximum pour la tournée?');
+  const bbl=document.getElementById(uid);if(!bbl)return;
+  const duid='d'+Date.now();
+  bbl.insertAdjacentHTML('beforeend',`
+    <div class="qr-wrap" id="dqr_${duid}" style="margin-top:8px">
+      <button class="qr-btn" onclick="pickDist('${duid}',15)">15 km</button>
+      <button class="qr-btn" onclick="pickDist('${duid}',25)">25 km</button>
+      <button class="qr-btn" onclick="pickDist('${duid}',35)">35 km</button>
+      <button class="qr-btn" onclick="pickDist('${duid}',9999)">Pas de limite</button>
+    </div>
+    <div style="display:flex;align-items:center;gap:7px;margin-top:8px">
+      <input type="number" id="dinput_${duid}" min="1" max="500" placeholder="Autre (km)"
+        style="width:110px;padding:4px 8px;border:1.5px solid #d0d5dd;border-radius:8px;font-size:12px;font-family:inherit"
+        onkeydown="if(event.key==='Enter')pickDistManual('${duid}')">
+      <button class="qr-btn" onclick="pickDistManual('${duid}')">OK</button>
+    </div>`);
+  window._distCb=window._distCb||{};
+  window._distCb[duid]=(val)=>{params.distanceMax=parseInt(val);setTimeout(askRepartition,600);};
+  scrollB();
+}
+function pickDist(duid,val){
+  document.querySelectorAll('#dqr_'+duid+' .qr-btn').forEach(b=>{b.disabled=true;b.style.opacity='0.5';});
+  const inp=document.getElementById('dinput_'+duid);if(inp)inp.disabled=true;
+  addU(val===9999?'Pas de limite':val+' km');
+  if(window._distCb&&window._distCb[duid])window._distCb[duid](val);
+}
+function pickDistManual(duid){
+  const inp=document.getElementById('dinput_'+duid);if(!inp)return;
+  const v=parseInt(inp.value);
+  if(!v||v<1){inp.style.borderColor='#e74c3c';inp.focus();return;}
+  document.querySelectorAll('#dqr_'+duid+' .qr-btn').forEach(b=>{b.disabled=true;b.style.opacity='0.5';});
+  inp.disabled=true;
+  addU(v+' km');
+  if(window._distCb&&window._distCb[duid])window._distCb[duid](v);
+}
+async function askRepartition(){
+  const uid=await addG(`Répartition souhaitée entre les types de visites?<br>
+    <small style="color:#888">Les Permis sont sélectionnés en priorité dans la zone la plus dense.</small>`);
+  // Sliders + champs numériques synchronisés avec total 100%
+  const uid2='sc'+Date.now();
+  const bbl2=document.getElementById(uid);if(!bbl2)return;
+  const slHtml=`
+    <div style="margin-top:9px;display:flex;flex-direction:column;gap:10px">
+      <div style="display:flex;align-items:center;gap:8px">
+        <span style="font-size:11px;color:#555;min-width:110px">🔴 Permis</span>
+        <input type="range" id="slpe2" min="0" max="100" value="60" style="flex:1;height:4px;accent-color:#e74c3c"
+          oninput="syncSlider('pe')">
+        <input type="number" id="npe2" min="0" max="100" value="60"
+          style="width:46px;padding:3px 5px;border:1px solid #e0e0e0;border-radius:6px;font-size:12px;text-align:center"
+          oninput="syncNum('pe')">
+        <span style="font-size:11px;color:#888">%</span>
+      </div>
+      <div style="display:flex;align-items:center;gap:8px">
+        <span style="font-size:11px;color:#555;min-width:110px">🟣 Insp. mutations</span>
+        <input type="range" id="slmu2" min="0" max="100" value="30" style="flex:1;height:4px;accent-color:#8e44ad"
+          oninput="syncSlider('mu')">
+        <input type="number" id="nmu2" min="0" max="100" value="30"
+          style="width:46px;padding:3px 5px;border:1px solid #e0e0e0;border-radius:6px;font-size:12px;text-align:center"
+          oninput="syncNum('mu')">
+        <span style="font-size:11px;color:#888">%</span>
+      </div>
+      <div style="display:flex;align-items:center;gap:8px">
+        <span style="font-size:11px;color:#555;min-width:110px">⚫ Actualisations</span>
+        <input type="range" id="slac2" min="0" max="100" value="10" style="flex:1;height:4px;accent-color:#7f8c8d"
+          oninput="syncSlider('ac')">
+        <input type="number" id="nac2" min="0" max="100" value="10"
+          style="width:46px;padding:3px 5px;border:1px solid #e0e0e0;border-radius:6px;font-size:12px;text-align:center"
+          oninput="syncNum('ac')">
+        <span style="font-size:11px;color:#888">%</span>
+      </div>
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-top:4px">
+        <span style="font-size:11px;color:#888">Total : <span id="total-pct" style="font-weight:700;color:#27ae60">100%</span></span>
+        <button class="ok-btn" id="${uid2}" onclick="confirmRepartition('${uid2}')">Confirmer →</button>
+      </div>
+      <button class="ok-btn" style="background:#27ae60;margin-top:0;align-self:flex-start" onclick="pickNoTypeRestriction('${uid2}')">Aucune restriction · min distance</button>
+    </div>`;
+  bbl2.insertAdjacentHTML('beforeend', slHtml);
+  scrollB();
+}
+async function askExtras(){
+  const arevoir=pool.filter(r=>r.aRevoir).length;
+  const ret1=pool.filter(r=>r.retard>=365).length;
+  const ret2=pool.filter(r=>r.retard>=730).length;
+  const multi=pool.filter(r=>r.isMultiple).length;
+  const priHaute=pool.filter(r=>r.priScore!=null).length;
+  const uid=await addG('Contraintes supplémentaires? <small style="color:#888">(optionnel)</small>');
+  const chips=[];
+  if(arevoir>0)chips.push({label:`⚠ À revoir (${arevoir})`,onToggle:v=>params.aRevoir=v});
+  if(ret1>0)chips.push({label:`🔴 Retard > 1 an (${ret1})`,onToggle:v=>params.retardMin=v?365:0});
+  if(ret2>0)chips.push({label:`🔴 Retard > 2 ans (${ret2})`,onToggle:v=>params.retardMin=v?730:0});
+  if(multi>0)chips.push({label:`🔵 Multiples (${multi})`,onToggle:v=>params.multipleOnly=v});
+  if(priHaute>0)chips.push({label:`⭐ Priorité (${priHaute})`,onToggle:v=>params.prioriteHaute=v});
+  addChips(uid,chips,()=>{
+    const ex=[];
+    if(params.aRevoir)ex.push('À revoir');
+    if(params.retardMin>0)ex.push(`Retard >${params.retardMin}j`);
+    if(params.multipleOnly)ex.push('Multiples');
+    if(params.prioriteHaute)ex.push('Priorité');
+    addU(ex.length?ex.join(' · '):'Aucune contrainte supplémentaire');
+    setTimeout(askConfirm,600);
+  });
+}
+async function askConfirm(){
+  let bassinLbl='';
+  if(params.bassin==='ALL'){
+    bassinLbl='Tous les bassins';
+  }else{
+    bassinLbl=`Bassin ${params.bassin}`;
+  }
+  const min=Math.round(params.nbVisites*(1-params.marge/100));
+  const max=Math.round(params.nbVisites*(1+params.marge/100));
+  const dist=params.distanceMax===9999?'Illimitée':params.distanceMax+' km';
+  const uid=await addG(`Résumé :<br>
+    🔹 <b>Bassin :</b> ${bassinLbl}<br>
+    🔹 <b>Visites :</b> ${params.nbVisites} ± ${params.marge}% (${min}–${max})<br>
+    🔹 <b>Distance max :</b> ${dist}<br>
+    🔹 <b>Répartition :</b> Permis ${params.pctPermis}% · Insp. mutations ${params.pctMutations}% · Actualisations ${params.pctActualisations}%<br>
+    ${params.retardMin>0?`🔹 <b>Priorité retard :</b> > ${params.retardMin} jours<br>`:''}
+    ${params.prioriteHaute?`🔹 <b>Contrainte :</b> ⭐ Priorité activée<br>`:''}` );
+  addQR(uid,[
+    {label:'🚀 Lancer la planification',val:'go'},
+    {label:'↩ Recommencer',val:'restart'},
+  ],(val)=>{
+    if(val==='go')setTimeout(launchPlanning,400);
+    else location.reload();
+  });
+}
+
+// ─── ALGORITHME ──────────────────────────────────────────────────────────────
+async function launchPlanning(){
+  // Si "Tous les bassins" → lancer une seule planification avec bassinF=null (tous les bassins)
+  if(params.bassin==='ALL'){
+    await launchPlanningForBassin(null,'#3b5bdb');
+    return;
+  }
+  // Sinon, lancer pour le bassin spécifique
+  await launchPlanningForBassin(Number(params.bassin),'#3b5bdb');
+}
+
+async function launchPlanningForBassin(bassinF, routeColor, isSecond=false){
+  const uidProg=isSecond
+    ? await addG(`⏳ <b>Bassin ${bassinF}</b> — Identification du secteur le plus dense...`)
+    : await addG('⏳ <b>Étape 1/3</b> — Identification du secteur le plus dense...');
+  const mapStatusMsg=bassinF===null?'Tous les bassins — Optimisation en cours...':`Bassin ${bassinF} — Optimisation en cours...`;
+  setMapStatus(mapStatusMsg);
+
+  // Filtrer par bassin si bassinF est défini, sinon utiliser tout le pool
+  let cands=bassinF===null ? pool : pool.filter(r=>Number(r.bassin)===Number(bassinF));
+  if(plannedMats.size)cands=cands.filter(r=>!plannedMats.has(r.matricule));
+  if(params.aRevoir)cands=cands.filter(r=>r.aRevoir);
+  if(params.retardMin>0)cands=cands.filter(r=>r.retard>=params.retardMin);
+  if(params.multipleOnly)cands=cands.filter(r=>r.isMultiple);
+  const geoAll=cands.filter(r=>r.lat&&r.lng);
+  if(geoAll.length<5){await addG('⚠ Pas assez de dossiers géocodés.');return;}
+
+  // Étape 1: ancrage par densité
+  const noType=params.noTypeRestriction;
+  const anchorPool=noType?geoAll:params.prioriteHaute&&geoAll.filter(r=>r.pri===1&&r.priScore!=null).length>=3?geoAll.filter(r=>r.pri===1&&r.priScore!=null):geoAll.filter(r=>r.pri===1);
+  let anchor;
+  let step1Html='';
+  if(lastTourPts.length&&anchorPool.length){
+    anchor=anchorPool.map(r=>({...r,_prev:minDistToLastTour(r)})).sort((a,b)=>a._prev-b._prev)[0];
+    step1Html=`✅ <b>Étape 1/3</b> — Continuation du quartier : point disponible le plus proche de la tournée précédente<br>
+      <small style="color:#888">Ancrage : ${anchor.adresse.replace(/,\s*SHERBROOKE.*/,'')}</small>`;
+  }else if(anchorPool.length>=3){
+    if(params.prioriteHaute){
+      // Utiliser la limite nominale (sans overhead) pour définir le rayon de scoring
+      // Sinon l'ancrage cherche dans un rayon gonflé et atterrit hors de la zone optimale
+      const limM=getTourLimitNominalMeters();
+      // Considérer tous les permis avec priScore, pas seulement les top100 par score individuel
+      // Un permis priScore=5 entouré de 20 autres priScore=8 est meilleur ancrage qu'un priScore=27 isolé
+      // Ancrage : point avec meilleure densité de visites dans 1.5km + score prioritaire
+      // Cherche dans TOUS les points géocodés, pas seulement ceux avec priScore
+      const R6=6371000;
+      const scored=geoAll.map(r=>{
+        const rl=r.lat*Math.PI/180;
+        // Densité : nombre de visites dans 1.5km
+        const nVisites=geoAll.reduce((s,q)=>{
+          const dl=(q.lat-r.lat)*Math.PI/180,dln=(q.lng-r.lng)*Math.PI/180;
+          const a=Math.sin(dl/2)**2+Math.cos(rl)*Math.cos(q.lat*Math.PI/180)*Math.sin(dln/2)**2;
+          return 2*R6*Math.atan2(Math.sqrt(a),Math.sqrt(1-a))<=1500?s+1:s;
+        },0);
+        // Score prioritaire cumulé dans la limite de tournée
+        const sumPri=geoAll.reduce((s,q)=>{
+          const dl=(q.lat-r.lat)*Math.PI/180,dln=(q.lng-r.lng)*Math.PI/180;
+          const a=Math.sin(dl/2)**2+Math.cos(rl)*Math.cos(q.lat*Math.PI/180)*Math.sin(dln/2)**2;
+          return 2*R6*Math.atan2(Math.sqrt(a),Math.sqrt(1-a))<=limM?s+(q.priScore||0):s;
+        },0);
+        // Densité prime sur priorité — ×5 par visite dans 1.5km
+        const sumScore=nVisites*5 + sumPri;
+        return {...r,sumScore,sumPri,nVisites};
+      });
+      anchor=scored.sort((a,b)=>b.sumScore-a.sumScore)[0];
+      step1Html=`✅ <b>Étape 1/3</b> — Zone optimale (⭐ score ${anchor.sumPri.toFixed(1)} · ${anchor.nVisites} visites/1.5km)<br>
+      <small style="color:#888">Ancrage : ${anchor.adresse.replace(/,\s*SHERBROOKE.*/,'').replace(/,\s*SHAWINIGAN.*/,'')}</small>`;    }else{
+      anchor=findDensestAnchor(anchorPool);
+      step1Html=`✅ <b>Étape 1/3</b> — Zone la plus dense : <b>${anchor.density} ${noType?'visites':'Permis'}</b> dans 1 km<br>
+      <small style="color:#888">Ancrage : ${anchor.adresse.replace(/,\s*SHERBROOKE.*/,'')}</small>`;
+    }
+  }else{
+    anchor={lat:geoAll.reduce((s,r)=>s+r.lat,0)/geoAll.length,lng:geoAll.reduce((s,r)=>s+r.lng,0)/geoAll.length};
+    step1Html='✅ <b>Étape 1/3</b> — Centroïde géographique utilisé.';
+  }
+  updateBubble(uidProg,step1Html+'<br>⏳ <b>Étape 2/3</b> — Sélection des candidats...');
+
+  // Étape 2: OSRM sur tous les candidats → sélection par distance routière réelle
+  const useRetard=params.retardMin>0;
+  const tot=(params.pctPermis+params.pctMutations+params.pctActualisations)||100;
+  const targetV=params.nbVisites;
+  const nTargetP=Math.round(targetV*params.pctPermis/tot);
+  const nTargetM=Math.round(targetV*params.pctMutations/tot);
+  const nTargetA=targetV-nTargetP-nTargetM;
+
+  const addHav = r => ({...r, _hav: haversine({lat:r.lat,lng:r.lng},{lat:anchor.lat,lng:anchor.lng})});
+  const byHav = (a,b) => (lastTourPts.length?minDistToLastTour(a)-minDistToLastTour(b):a._hav-b._hav);
+  const isMono_pool=!noType&&(params.pctPermis===100||params.pctMutations===100||params.pctActualisations===100);
+  let HAV_PREFILTER = DENSITY_RADIUS;
+  let geoFiltered = [];
+  while(HAV_PREFILTER <= 10000){
+    const inRange = r => lastTourPts.length
+      ? minDistToLastTour(r) <= (params.prioriteHaute ? getTourLimitMeters() : HAV_PREFILTER)
+      : r._hav <= (params.prioriteHaute ? getTourLimitMeters() : HAV_PREFILTER);
+    if(noType){
+      const byPriAll=(a,b)=>(b.priScore||0)-(a.priScore||0);
+      geoFiltered = geoAll.map(addHav).filter(inRange).sort(params.prioriteHaute?byPriAll:byHav).slice(0,180);
+    }else{
+      const byPri=(a,b)=>(b.priScore||0)-(a.priScore||0);
+      const capP=params.prioriteHaute?targetV*6:(isMono_pool?20:32);
+      const p80raw = geoAll.filter(r=>r.pri===1).map(addHav).filter(inRange).sort(params.prioriteHaute?byPri:byHav).slice(0,capP);
+      // En mode priorité : forcer l'inclusion des permis critiques (priScore >= seuil) même s'ils dépassent capP
+      const p80 = params.prioriteHaute
+        ? (() => {
+            const critiques = geoAll.filter(r=>r.pri===1&&(r.priScore||0)>=SEUIL_PRIORITE_CRITIQUE).map(addHav).filter(inRange);
+            return [...new Map([...critiques,...p80raw].map(r=>[r.matricule,r])).values()];
+          })()
+        : p80raw;
+      const m80 = geoAll.filter(r=>r.pri===2).map(addHav).filter(inRange).sort(byHav).slice(0,isMono_pool?30:30);
+      const a80 = geoAll.filter(r=>r.pri===3).map(addHav).filter(inRange).sort(byHav).slice(0,isMono_pool?30:18);
+      geoFiltered = [...p80, ...m80, ...a80];
+    }
+    if(geoFiltered.length >= targetV) break;
+    HAV_PREFILTER += 500;
+  }
+
+  // S'assurer que l'ancrage est inclus
+  if(anchor.matricule && !geoFiltered.find(r=>r.matricule===anchor.matricule)){
+    const anch=geoAll.find(r=>r.matricule===anchor.matricule);
+    if(anch) geoFiltered=[addHav(anch),...geoFiltered.slice(0,79)];
+  }
+
+  const allPts=geoFiltered.map(r=>{return{lat:r.lat,lng:r.lng}});
+
+  updateBubble(uidProg,step1Html+
+    `<br>⏳ <b>Étape 2/3</b> — Calcul distances routières (${geoFiltered.length} dossiers)...`);
+
+  const roadDists=noType ? null : await calcMatrix(allPts);
+  // Ancrage est dans geoFiltered — trouver son index
+  const anchorRowIdx = Math.max(0, geoFiltered.findIndex(r=>r.matricule===anchor.matricule));
+
+  const geoAllIdx=geoFiltered.map((r,i)=>{return{...r,_idx:i}});
+  const isMono=!noType&&(params.pctPermis===100||params.pctMutations===100||params.pctActualisations===100);
+  let finalCands;
+  if(noType){
+    finalCands=geoAllIdx
+      .map(r=>({...r,distA:(r._hav!=null?r._hav:haversine({lat:r.lat,lng:r.lng},{lat:anchor.lat,lng:anchor.lng}))*1.35}))
+      .sort(params.prioriteHaute?(a,b)=>(b.priScore||0)-(a.priScore||0):(a,b)=>a.distA-b.distA)
+      .slice(0,Math.min(180,targetV*6));
+  }else{
+  let selP=selectByType(geoAllIdx,1,nTargetP,useRetard,roadDists,anchorRowIdx);
+  // Si mono-type et pas assez → élargir rayon (6km) plutôt que changer de type
+  if(isMono&&selP.length<nTargetP){
+    selP=selectByType(geoAllIdx,1,nTargetP,useRetard,roadDists,anchorRowIdx,MAX_DIST_ANCRAGE*2); // 4km si manque
+  }
+  const manqueP=isMono?0:nTargetP-selP.length;
+  const selM=selectByType(geoAllIdx,2,nTargetM+Math.max(0,manqueP),useRetard,roadDists,anchorRowIdx);
+  const selA=selectByType(geoAllIdx,3,Math.max(0,nTargetA),useRetard,roadDists,anchorRowIdx);
+  finalCands=[...selP,...selM,...selA].slice(0,targetV);
+  }
+
+  if(finalCands.length<2){await addG('⚠ Pas assez de candidats dans ce secteur.');return;}
+
+  updateBubble(uidProg,step1Html+
+    `<br>✅ <b>Étape 2/3</b> — ${finalCands.length} candidats (distances routières réelles)`+
+    `<br>⏳ <b>Étape 3/3</b> — Optimisation de la tournée...`);
+
+  // Étape 3: matrice routière entre finalCands.
+  // Important: l'ordre de tournée doit être optimisé avec les mêmes distances
+  // que le tracé final, sinon le parcours peut emprunter des détours routiers
+  // sans visite sélectionnée dans le secteur traversé.
+  const pts=finalCands.map(r=>{return{lat:r.lat,lng:r.lng}});
+  let finalMatrix=await calcMatrix(pts);
+
+  // Filtre outlier géographique: exclure points > 1.5 sigma du centroïde
+  // Désactivé pour mono-type (100% d'un seul type) — MAX_DIST_ANCRAGE suffit
+  if(finalCands.length>4&&!isMono&&!noType&&!params.prioriteHaute){
+    const fcLat=finalCands.reduce((s,g)=>s+g.lat,0)/finalCands.length;
+    const fcLng=finalCands.reduce((s,g)=>s+g.lng,0)/finalCands.length;
+    const dists=finalCands.map(g=>haversine({lat:g.lat,lng:g.lng},{lat:fcLat,lng:fcLng}));
+    const mean=dists.reduce((s,d)=>s+d,0)/dists.length;
+    const std=Math.sqrt(dists.reduce((s,d)=>s+(d-mean)**2,0)/dists.length);
+    const threshold=mean+1.0*std; // plus strict pour exclure points trans-rivière
+    const before=finalCands.length;
+    const anchorMat=anchor.matricule||null;
+    finalCands=finalCands.filter((r,i)=>dists[i]<=threshold||r.matricule===anchorMat);
+    if(finalCands.length<before){
+      const pts2=finalCands.map(r=>{return{lat:r.lat,lng:r.lng}});
+      finalMatrix=await calcMatrix(pts2);
+    }
+  }
+
+  // Compléter si manque de visites après filtre sigma
+  const candidateCap=Math.min(noType?180:80,targetV*(noType?6:3));
+  if(finalCands.length < candidateCap){
+    const dejaMats=new Set(finalCands.map(r=>r.matricule));
+    const extras=geoAllIdx
+      .filter(r=>!dejaMats.has(r.matricule))
+      .map(r=>({...r,distA:(!noType&&roadDists&&roadDists[anchorRowIdx]&&roadDists[anchorRowIdx][r._idx]!=null)
+        ?roadDists[anchorRowIdx][r._idx]
+        :haversine({lat:r.lat,lng:r.lng},{lat:anchor.lat,lng:anchor.lng})*1.35}))
+      .filter(r=>r.distA<=MAX_DIST_ANCRAGE*2)
+      .sort((a,b)=>a.distA-b.distA)
+      .slice(0,candidateCap-finalCands.length);
+    if(extras.length>0){
+      finalCands=[...finalCands,...extras];
+      const pts3=finalCands.map(r=>{return{lat:r.lat,lng:r.lng}});
+      finalMatrix=await calcMatrix(pts3);
+    }
+  }
+
+  // Départ = point le plus proche de l'ancrage
+  let start=0,minDC=Infinity;
+  finalCands.forEach((g,i)=>{
+    const d=haversine({lat:g.lat,lng:g.lng},{lat:anchor.lat,lng:anchor.lng});
+    if(d<minDC){minDC=d;start=i;}
+  });
+  const minV=Math.round(params.nbVisites*(1-params.marge/100));
+  const maxV=Math.round(params.nbVisites*(1+params.marge/100));
+  const limitM=getTourLimitMeters();
+  const visitLimit=maxV;
+  const tourCostMatrix=buildCostMatrix(pts,finalMatrix);
+  let builtTour=await buildLimitedTour(finalCands,finalMatrix,start,visitLimit,limitM,tourCostMatrix);
+  if(noType&&builtTour.tour.length===targetV){
+    builtTour=improveTourBySwap(finalCands,finalMatrix,builtTour.tour,start,limitM,tourCostMatrix);
+  }
+  const tour=builtTour.tour;
+  let totalM=builtTour.totalM;
+  selected=tour.map(idx=>finalCands[idx]);
+  // fillRouteCorridorVisits — version haversine pure, pas d'appels OSRM internes
+  const corridorFill=await fillRouteCorridorVisits(selected,geoAll,totalM,limitM,maxV);
+  selected=corridorFill.selected;
+  totalM=corridorFill.totalM;
+  let limitCheck=await enforceRealRouteLimit(selected,limitM,minV);
+  selected=limitCheck.selected;
+  totalM=limitCheck.totalM;
+
+  // Après avoir retiré les détours pour respecter la vraie limite, il peut rester
+  // de la place. On relance alors le complément sur les visites déjà proches du trajet.
+  let routeCoords=limitCheck.routeCoords||corridorFill.routeCoords||await calcRoute(selected.map(g=>{return{lat:g.lat,lng:g.lng}}));
+  let realM=routeCoords&&routeCoords.distanceM!=null?routeCoords.distanceM:totalM;
+  console.log('[DIST] realM='+Math.round(realM)+'m totalM='+Math.round(totalM)+'m pts='+selected.length);
+  if(selected.length<minV&&realM<limitM){
+    const refill=await fillRouteCorridorVisits(selected,geoAll,realM,limitM,maxV);
+    selected=refill.selected;
+    totalM=refill.totalM;
+    limitCheck=await enforceRealRouteLimit(selected,limitM,0);
+    selected=limitCheck.selected;
+    totalM=limitCheck.totalM;
+    routeCoords=limitCheck.routeCoords||refill.routeCoords||routeCoords;
+    realM=routeCoords&&routeCoords.distanceM!=null?routeCoords.distanceM:totalM;
+  }
+  const totalKm=formatKm(realM);
+
+  planningDone=true;
+  showFinalMap(bassinF,totalKm,routeCoords,routeColor,isSecond);
+
+  const nP=selected.filter(g=>g.pri===1).length;
+  const nM=selected.filter(g=>g.pri===2).length;
+  const nA=selected.filter(g=>g.pri===3).length;
+  const pP=Math.round(nP/selected.length*100)||0;
+  const pM=Math.round(nM/selected.length*100)||0;
+  const pA=Math.round(nA/selected.length*100)||0;
+  const urg=selected.filter(g=>g.retard>0).length;
+  const corridorDiagHtml=selected.length<minV
+    ? await corridorDiagnosticHtml(selected,geoAll,routeCoords,limitM)
+    : '';
+
+  updateBubble(uidProg,step1Html+
+    `<br>✅ <b>Étape 2/3</b> — ${finalCands.length} candidats proches de l'ancrage`+
+    `<br>✅ <b>Étape 3/3</b> — Tournée optimisée (${totalKm} km / ${getTourLimitLabel()})`);
+
+  const bassinLabel = bassinF===null?'Tous les bassins':`Bassin ${bassinF}`;
+  // ── Stats priorité (si contrainte activée) ──────────────────────────────
+  let priStatsHtml='';
+  if(params.prioriteHaute){
+    // scoreDisponible = permis dans le rayon de la tournée seulement (pas tout le bassin)
+    const rayonM = getTourLimitMeters()===Infinity ? 5000 : getTourLimitMeters();
+    const permisRayon=geoAll.filter(r=>r.pri===1&&r.priScore!=null&&
+      haversine({lat:anchor.lat,lng:anchor.lng},{lat:r.lat,lng:r.lng})<=rayonM);
+    const scoreDisponible=permisRayon.reduce((s,r)=>s+(r.priScore||0),0);
+    const scoreTournee=selected.filter(r=>r.pri===1&&r.priScore!=null).reduce((s,r)=>s+(r.priScore||0),0);
+    const pctCapture=scoreDisponible>0?Math.round(scoreTournee/scoreDisponible*100):0;
+    const critiquesRayon=permisRayon.filter(r=>r.priScore>=SEUIL_PRIORITE_CRITIQUE).length;
+    const critiquesTournee=selected.filter(r=>r.pri===1&&r.priScore!=null&&r.priScore>=SEUIL_PRIORITE_CRITIQUE).length;
+    priStatsHtml=`<div style="margin-top:10px;padding:8px 10px;background:#fff8e1;border:1px solid #f9a825;border-radius:7px;font-size:12px">
+      <div style="font-weight:700;color:#e67e22;margin-bottom:5px">⭐ Potentiel prioritaire capturé</div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:5px">
+        <div style="background:#fff;border-radius:5px;padding:5px 8px;text-align:center">
+          <div style="font-size:18px;font-weight:700;color:#e67e22">${pctCapture}%</div>
+          <div style="font-size:10px;color:#888">Score capturé</div>
+          <div style="font-size:10px;color:#aaa">${scoreTournee.toFixed(1)} / ${scoreDisponible.toFixed(1)}</div>
+        </div>
+        <div style="background:#fff;border-radius:5px;padding:5px 8px;text-align:center">
+          <div style="font-size:18px;font-weight:700;color:#e74c3c">${critiquesTournee} / ${critiquesRayon}</div>
+          <div style="font-size:10px;color:#888">Critiques (≥${SEUIL_PRIORITE_CRITIQUE})</div>
+          <div style="font-size:10px;color:#aaa">dans la tournée / dans le rayon</div>
+        </div>
+      </div>
+    </div>`;
+  }
+
+  const resUid=await addG(`✅ <b>Planification terminée — ${bassinLabel}!</b>
+    <div class="res-grid" id="res-grid-inner">
+      <div class="res-box"><div class="res-v" id="stat-nb" style="color:#3b5bdb">${selected.length}</div><div class="res-l">Visites</div></div>
+      <div class="res-box"><div class="res-v" id="stat-km" style="color:#e67e22">${totalKm} km</div><div class="res-l">Distance routière</div></div>
+      <div class="res-box"><div class="res-v" id="stat-pp" style="color:#e74c3c">${nP} <span style="font-size:12px;font-weight:400">${pP}%</span></div><div class="res-l">Permis</div></div>
+      <div class="res-box"><div class="res-v" id="stat-pm" style="color:#8e44ad">${nM} <span style="font-size:12px;font-weight:400">${pM}%</span></div><div class="res-l">Insp. mutations</div></div>
+      <div class="res-box"><div class="res-v" id="stat-pa" style="color:#7f8c8d">${nA} <span style="font-size:12px;font-weight:400">${pA}%</span></div><div class="res-l">Actualisations</div></div>
+      <div class="res-box"><div class="res-v" id="stat-urg" style="color:#e74c3c">${urg}</div><div class="res-l">Urgents</div></div>
+    </div>
+    ${priStatsHtml}
+    ${corridorDiagHtml}
+    ${selected.length<minV?`<br><small style="color:#c0392b">⚠ La limite de ${getTourLimitLabel()} ne permet pas d'atteindre le minimum de ${minV} visites (${formatKm(realM)} km obtenus).</small>`:''}
+    <br><small style="color:#888">💡 Cliquez sur un point pour ajouter/retirer, puis 🔄 Recalculer.</small>`);
+  resultBoxId=resUid;
+  updateBadge();
+  document.getElementById('txt-inp').disabled=true;
+  document.getElementById('txt-inp').placeholder='Rechargez la page pour recommencer';
+  document.getElementById('btn-send').disabled=true;
+}
+
+function sendMsg(){
+  const inp=document.getElementById('txt-inp');if(inp.disabled)return;
+  const txt=inp.value.trim();if(!txt)return;
+  addU(txt);inp.value='';
+  setTimeout(()=>addG('Compris. Continuez avec les étapes ou recommencez.',400),300);
+}
+
+window.onload=()=>{
+  addG(`Bonjour. Je suis l'assistant de planification des inspections. Je vous aide à sélectionner et optimiser les visites de la semaine selon vos contraintes opérationnelles.`,800);
+};
+</script>
+</body>
+</html>
