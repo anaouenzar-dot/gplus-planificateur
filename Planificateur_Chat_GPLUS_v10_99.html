@@ -736,7 +736,7 @@ function redrawPool(bassin,fitBounds){
   const selMats=new Set(selected.map(r=>r.matricule));
   const shownPos=new Set(selected.filter(g=>g.lat&&g.lng).map(g=>`${g.lat.toFixed(5)},${g.lng.toFixed(5)}`));
   const pts=pool
-    .filter(r=>bassin!==null?Number(r.bassin)===Number(bassin):true)
+    .filter(r=>currentSecteur?r.secteur===currentSecteur:(bassin!==null?Number(r.bassin)===Number(bassin):true))
     .filter(r=>!plannedMats.has(r.matricule))
     .filter(r=>r.lat&&r.lng&&!selMats.has(r.matricule))
     .filter(r=>{const k=`${r.lat.toFixed(5)},${r.lng.toFixed(5)}`;if(shownPos.has(k))return false;shownPos.add(k);return true;});
@@ -769,7 +769,7 @@ function showFinalMap(bassin,totalKm,routeCoords,routeColor='#3b5bdb',isSecond=f
   const selMats=new Set(selected.map(r=>r.matricule));
   const shownPos=new Set(selected.filter(g=>g.lat&&g.lng).map(g=>`${g.lat.toFixed(5)},${g.lng.toFixed(5)}`));
 
-  pool.filter(r=>bassin!==null?Number(r.bassin)===Number(bassin):true)
+  pool.filter(r=>currentSecteur?r.secteur===currentSecteur:(bassin!==null?Number(r.bassin)===Number(bassin):true))
       .filter(r=>r.lat&&r.lng&&!selMats.has(r.matricule)&&!plannedMats.has(r.matricule))
       .filter(r=>{const k=`${r.lat.toFixed(5)},${r.lng.toFixed(5)}`;if(shownPos.has(k))return false;shownPos.add(k);return true;})
       .forEach(r=>{
@@ -794,7 +794,7 @@ function showFinalMap(bassin,totalKm,routeCoords,routeColor='#3b5bdb',isSecond=f
      .bindPopup(popupHtml(g,true)).addTo(layerSel);
   });
 
-  const allPtsB=pool.filter(r=>bassin!==null?Number(r.bassin)===Number(bassin):true).filter(r=>r.lat&&r.lng);
+  const allPtsB=pool.filter(r=>currentSecteur?r.secteur===currentSecteur:(bassin!==null?Number(r.bassin)===Number(bassin):true)).filter(r=>r.lat&&r.lng);
   if(!isSecond&&allPtsB.length>0&&iterationNo===1)lmap.fitBounds(L.latLngBounds(allPtsB.map(r=>[r.lat,r.lng])),{padding:[20,20]});
   else if(iterationNo>1&&selected.length>0)lmap.fitBounds(L.latLngBounds(selected.map(r=>[r.lat,r.lng])),{padding:[40,40]});
   else if(isSecond){
@@ -1257,35 +1257,50 @@ async function askCompletionOrder(mainType){
 }
 
 async function askBassin(){
-  // Extraire les bassins uniques du pool
-  const bassinsSet=new Set();
-  pool.forEach(r=>{
-    if(r.bassin)bassinsSet.add(r.bassin);
-  });
-  const bassins=Array.from(bassinsSet).sort((a,b)=>a-b);
+  // Vérifier si la colonne Secteur est présente dans le pool
+  const hasSecteur=pool.some(r=>r.secteur&&r.secteur!==''&&r.secteur!=='undefined');
   
-  if(bassins.length===0){
-    addG('❌ Aucun bassin trouvé dans le fichier.');
-    return;
+  if(hasSecteur){
+    // Mode Secteur — utiliser les valeurs uniques de la colonne Secteur
+    const secteursSet=new Set();
+    pool.forEach(r=>{if(r.secteur&&r.secteur!=='')secteursSet.add(r.secteur);});
+    const secteurs=Array.from(secteursSet).sort();
+    const opts=secteurs.map(s=>({label:s,val:'S:'+s}));
+    opts.push({label:'Tous les secteurs',val:'ALL'});
+    const uid=await addG('Pour quel secteur souhaitez-vous planifier?');
+    addQR(uid,opts,(val)=>{
+      params.bassin=val;
+      if(val==='ALL'){
+        currentBassin=null;
+        currentSecteur=null;
+      }else{
+        currentBassin=null;
+        currentSecteur=val.replace('S:','');
+      }
+      redrawPool(currentBassin,true);
+      initRectSelect();
+      updateBadge();
+      setTimeout(askNbVisites,600);
+    });
+  } else {
+    // Mode Bassin — comportement original
+    const bassinsSet=new Set();
+    pool.forEach(r=>{if(r.bassin)bassinsSet.add(r.bassin);});
+    const bassins=Array.from(bassinsSet).sort((a,b)=>a-b);
+    if(bassins.length===0){addG('❌ Aucun bassin trouvé dans le fichier.');return;}
+    const opts=bassins.map(b=>({label:`Bassin ${b}`,val:b}));
+    opts.push({label:'Tous les bassins',val:'ALL'});
+    const uid=await addG('Pour quel bassin souhaitez-vous planifier?');
+    addQR(uid,opts,(val)=>{
+      params.bassin=val;
+      currentSecteur=null;
+      if(val==='ALL'){currentBassin=null;}else{currentBassin=Number(val);}
+      redrawPool(currentBassin,true);
+      initRectSelect();
+      updateBadge();
+      setTimeout(askNbVisites,600);
+    });
   }
-  
-  // Construire les options dynamiquement
-  const opts=bassins.map(b=>({label:`Bassin ${b}`,val:b}));
-  opts.push({label:'Tous les bassins',val:'ALL'});
-  
-  const uid=await addG('Pour quel bassin souhaitez-vous planifier?');
-  addQR(uid,opts,(val)=>{
-    params.bassin=val;
-    if(val==='ALL'){
-      currentBassin=null;
-    }else{
-      currentBassin=Number(val);
-    }
-    redrawPool(currentBassin,true);
-  initRectSelect();
-    updateBadge();
-    setTimeout(askNbVisites,600);
-  });
 }
 
 
