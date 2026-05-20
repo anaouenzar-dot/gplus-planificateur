@@ -1424,7 +1424,9 @@ async function askExtras(){
 async function askConfirm(){
   let bassinLbl='';
   if(params.bassin==='ALL'){
-    bassinLbl='Tous les bassins';
+    bassinLbl=currentSecteur?'Tous les secteurs':'Tous les bassins';
+  }else if(currentSecteur){
+    bassinLbl=currentSecteur;
   }else{
     bassinLbl=`Bassin ${params.bassin}`;
   }
@@ -1432,7 +1434,7 @@ async function askConfirm(){
   const max=Math.round(params.nbVisites*(1+params.marge/100));
   const dist=params.distanceMax===9999?'Illimitée':params.distanceMax+' km';
   const uid=await addG(`Résumé :<br>
-    🔹 <b>Bassin :</b> ${bassinLbl}<br>
+    🔹 <b>${currentSecteur?'Secteur':'Bassin'} :</b> ${bassinLbl}<br>
     🔹 <b>Visites :</b> ${params.nbVisites} ± ${params.marge}% (${min}–${max})<br>
     🔹 <b>Distance max :</b> ${dist}<br>
     🔹 <b>Répartition :</b> Permis ${params.pctPermis}% · Insp. mutations ${params.pctMutations}% · Actualisations ${params.pctActualisations}%<br>
@@ -1462,11 +1464,20 @@ async function launchPlanningForBassin(bassinF, routeColor, isSecond=false){
   const uidProg=isSecond
     ? await addG(`⏳ <b>Bassin ${bassinF}</b> — Identification du secteur le plus dense...`)
     : await addG('⏳ <b>Étape 1/3</b> — Identification du secteur le plus dense...');
-  const mapStatusMsg=bassinF===null?'Tous les bassins — Optimisation en cours...':`Bassin ${bassinF} — Optimisation en cours...`;
+  const secteurNomMsg=currentSecteur&&String(bassinF).startsWith('S:')?String(bassinF).replace('S:',''):null;
+  const mapStatusMsg=bassinF===null?`${currentSecteur?'Tous les secteurs':'Tous les bassins'} — Optimisation en cours...`:`${secteurNomMsg||'Bassin '+bassinF} — Optimisation en cours...`;
   setMapStatus(mapStatusMsg);
 
   // Filtrer par bassin si bassinF est défini, sinon utiliser tout le pool
-  let cands=bassinF===null ? pool : pool.filter(r=>Number(r.bassin)===Number(bassinF));
+  let cands;
+  if(bassinF===null){
+    cands=pool;
+  }else if(currentSecteur&&String(bassinF).startsWith('S:')){
+    const secteurNom=String(bassinF).replace('S:','');
+    cands=pool.filter(r=>r.secteur===secteurNom);
+  }else{
+    cands=pool.filter(r=>Number(r.bassin)===Number(bassinF));
+  }
   if(plannedMats.size)cands=cands.filter(r=>!plannedMats.has(r.matricule));
   if(params.aRevoir)cands=cands.filter(r=>r.aRevoir);
   if(params.retardMin>0)cands=cands.filter(r=>r.retard>=params.retardMin);
